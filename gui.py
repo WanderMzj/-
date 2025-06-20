@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRect, QPoint, QSize
 from PySide6.QtGui import QImage, QPixmap,QAction
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from PySide6.QtWidgets import QScrollArea
 import image_utils as iu
 
 class ImageLabel(QLabel):
@@ -119,13 +120,21 @@ class ImageApp(QMainWindow):
         am.addAction("展示HSV图层",     lambda:self.show_channels('HSV'))
         fm2 = mb.addMenu("滤波")
         fm2.addAction("平滑/锐化", self.filter_dialog)
+        dm = mb.addMenu("检测")
+        dm.addAction("边缘/直线检测", self.edge_line_dialog)
 
-        # 中心
+
+        # 中心 & 裁剪回调（改为 QScrollArea 包裹）
         w = QWidget(); self.setCentralWidget(w)
         hbox = QHBoxLayout(w)
-        self.img_label = ImageLabel(); self.img_label.setAlignment(Qt.AlignCenter)
+        self.img_label = ImageLabel()
+        self.img_label.setAlignment(Qt.AlignCenter)
         self.img_label.crop_callback = self.do_crop
-        hbox.addWidget(self.img_label, 3)
+        # 用 QScrollArea 包裹 QLabel
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(self.img_label)
+        self.scroll_area.setWidgetResizable(True)
+        hbox.addWidget(self.scroll_area, 3)
 
         # 右侧面板：滑块 + 缩放
         ctrl = QVBoxLayout(); hbox.addLayout(ctrl, 1)
@@ -176,29 +185,60 @@ class ImageApp(QMainWindow):
             self.history.append(self._proc.copy())
             if len(self.history)>20: self.history.pop(0)
 
+    # gui.py 中把 update_display 改成：
     def update_display(self):
         img = self._proc
-        h,w = img.shape[:2]; bpl = 3*w
-        rgb = img[...,::-1].copy()
-        qimg = QImage(rgb.data, w, h, bpl, QImage.Format_RGB888)
-        pix  = QPixmap.fromImage(qimg).scaled(
-            self.img_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation)
+        h, w = img.shape[:2]
+        bytes_line = 3*w
+        rgb = img[..., ::-1].copy()
+        qimg = QImage(rgb.data, w, h, bytes_line, QImage.Format_RGB888)
+        pix  = QPixmap.fromImage(qimg)
+        # 不再做 .scaled(label.size()), 而是让 label 自身变成图片大小
         self.img_label.setPixmap(pix)
+        self.img_label.resize(pix.size())
+
 
      # —— 打开图片立刻显示 & 初始化缩放滑块 —— #
     def open_image(self):
-        path,_=QFileDialog.getOpenFileName(self,"打开图片","","*.png *.jpg *.bmp")
-        if not path: return
-        img=cv2.imread(path)
-        if img is None: return
-        self._orig=img.copy(); self._proc=img.copy(); self.history.clear()
-        h,w=img.shape[:2]
-        # 缩放滑块范围
-        self.slider_w.setRange(1, w*3); self.slider_h.setRange(1, h*3)
-        self.slider_w.setValue(w);     self.slider_h.setValue(h)
-        self.update_display()
+        path, _ = QFileDialog.getOpenFileName(self, "打开图片", "", "*.png *.jpg *.bmp")
+        if not path:
+            return
+        img = cv2.imread(path)
+        if img is None:
+            return
+
+        # 1. 保存原图，清空历史
+        self._orig = img.copy()
+        self.history.clear()
+
+        # 2. 计算视口大小
+        vw = self.scroll_area.viewport().width()
+        vh = self.scroll_area.viewport().height()
+        orig_h, orig_w = img.shape[:2]
+
+        # 3. 适配视口的初始缩放比例（不放大，只缩小）
+        fit_ratio = min(vw/orig_w, vh/orig_h, 1.0)
+        init_w    = max(1, int(orig_w * fit_ratio))
+        init_h    = max(1, int(orig_h * fit_ratio))
+
+        # 4. 设置放缩滑块范围为原图的 [1,1.5×]，上限调低
+        max_w = int(orig_w * 1.5)
+        max_h = int(orig_h * 1.5)
+        self.slider_w.setRange(1, max_w)
+        self.slider_h.setRange(1, max_h)
+
+        # 5. 初始值阻断信号后设置为适配尺寸
+        self.slider_w.blockSignals(True)
+        self.slider_h.blockSignals(True)
+        self.slider_w.setValue(init_w)
+        self.slider_h.setValue(init_h)
+        self.slider_w.blockSignals(False)
+        self.slider_h.blockSignals(False)
+
+        # 6. 通过 on_resize_slider 生成并显示首次缩放结果
+        self._proc = self._orig.copy()
+        self.on_resize_slider()
+
 
          # —— 复原功能 —— #
     def reset_all(self):
@@ -219,7 +259,9 @@ class ImageApp(QMainWindow):
     def on_resize_slider(self, *_):
         if self._orig is None: return
         self.push_history()
-        w=self.slider_w.value(); h=self.slider_h.value()
+        # 1. 先取滑块值并 clamp
+        w = max(1, self.slider_w.value())
+        h = max(1, self.slider_h.value())
         if self.chk_ratio.isChecked():
             oh,ow=self._orig.shape[:2]; ar=ow/oh
             sender=self.sender()
@@ -327,3 +369,106 @@ class ImageApp(QMainWindow):
         canvas = FigureCanvas(fig)
         lay = QVBoxLayout(dlg); lay.addWidget(canvas)
         dlg.resize(600,400); dlg.exec()
+
+    def edge_line_dialog(self):
+        if self._proc is None:
+            return
+
+        # 1. 创建对话框
+        dlg = QDialog(self)
+        dlg.setWindowTitle("边缘检测与线条检测")
+        dlg.resize(800, 600)             # 对话框尺寸
+        form = QFormLayout(dlg)
+
+        # 2. 功能下拉
+        combo1 = QComboBox()
+        combo1.addItems(["边缘检测", "线条变化检测"])
+        form.addRow("功能：", combo1)
+
+        # 3. 算子下拉
+        combo2 = QComboBox()
+        form.addRow("算子：", combo2)
+
+        # 4. 预览区域
+        preview_label = QLabel()
+        preview_label.setFixedSize(600, 400)
+        preview_label.setAlignment(Qt.AlignCenter)
+        form.addRow("预览：", preview_label)
+
+        # 5. 确认按钮
+        btn = QPushButton("确认")
+        form.addRow(btn)
+
+        # 6. 参数映射
+        para = {
+            "roberts算子":"roberts","sobel算子":"sobel","laplacian算子":"laplacian",
+            "LoG算子":"log",       "canny算子":"canny", "prewitt算子":"prewitt",
+            "曲线检测":"curve",    "直线检测":"line"
+        }
+
+        raw = self._proc.copy()  # 缓存当前图
+
+        # 7. 动态更新算子列表
+        def update_ops():
+            combo2.clear()
+            if combo1.currentText() == "边缘检测":
+                combo2.addItems(
+                    ["roberts算子","sobel算子","laplacian算子",
+                     "LoG算子","canny算子","prewitt算子"]
+                )
+            else:
+                combo2.addItems(["曲线检测","直线检测"])
+            update_preview()
+
+        # 8. 生成并显示预览
+        def update_preview():
+            op1 = combo1.currentText()
+            key = para.get(combo2.currentText(), "")
+            if not key:
+                return
+
+            # 1. 生成预览图 pre（BGR）
+            if op1 == "边缘检测":
+                pre = iu.edgedetect(raw, key)
+            else:
+                pre = iu.houghlines(raw, key)
+
+            # 2. BGR→RGB，并强制 C 连续
+            # 方法 A：用 cvtColor（会返回连续数组）
+            rgb = cv2.cvtColor(pre, cv2.COLOR_BGR2RGB)
+            # 或 方法 B：切片后 copy
+            # rgb = pre[..., ::-1].copy()
+
+            # 3. 构造 QImage
+            h, w = rgb.shape[:2]
+            bpl  = 3 * w
+            qimg = QImage(rgb.data, w, h, bpl, QImage.Format_RGB888)
+
+            # 4. 缩放并显示
+            pix = QPixmap.fromImage(qimg).scaled(
+                preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation)
+            preview_label.setPixmap(pix)
+
+
+        # 9. 确认后把结果写回主图
+        def on_confirm():
+            op1 = combo1.currentText()
+            key = para.get(combo2.currentText(), "")
+            self.push_history()
+            if op1 == "边缘检测":
+                self._proc = iu.edgedetect(raw, key)
+            else:
+                self._proc = iu.houghlines(raw, key)
+            self.update_display()
+            dlg.accept()
+
+        # 10. 绑定信号
+        combo1.currentIndexChanged.connect(update_ops)
+        combo2.currentIndexChanged.connect(update_preview)
+        btn.clicked.connect(on_confirm)
+
+        # 11. 初始化并执行对话
+        update_ops()
+        dlg.exec()
